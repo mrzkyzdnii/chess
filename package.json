@@ -1,0 +1,17 @@
+{
+  "name": "snake-arena-mini",
+  "version": "1.0.0",
+  "description": "Realtime multiplayer .io-style snake game (HD canvas) with WebSocket server for WhatsApp bot integration",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["websocket", "game", "snake", "io", "realtime", "multiplayer", "whatsapp"],
+  "author": "kt",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
