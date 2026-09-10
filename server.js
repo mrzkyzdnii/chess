@@ -369,28 +369,15 @@ function finish(g) {
 
 function gameData(room, ws) {
     const g = room.game
-    const yourColor = room.white?.ws === ws ? 'w' : room.black?.ws === ws ? 'b' : null
     return {
         roomId: room.id,
-        yourColor,
-        color: yourColor,
+        yourColor: room.white?.ws === ws ? 'w' : 'b',
         board: clone(g.board),
         turn: g.turn,
-        lastMove: g.lastMove ? clone(g.lastMove) : null,
-        check: inCheck(g, g.turn),
-        moveHistory: clone(g.history),
         whiteName: room.white?.name || '',
-        blackName: room.black?.name || '',
-        opponentName: yourColor === 'w' ? (room.black?.name || 'Lawan') : (room.white?.name || 'Lawan')
+        blackName: room.black?.name || ''
     }
 }
-
-function sendGameState(room, ws) {
-    if (!room?.game || room.status !== 'playing') return
-    const data = gameData(room, ws)
-    send(ws, 'game_state', data)
-}
-
 
 function stateData(g) {
     return {
@@ -398,23 +385,21 @@ function stateData(g) {
         turn: g.turn,
         lastMove: g.lastMove ? clone(g.lastMove) : null,
         check: inCheck(g,g.turn),
-        moveHistory: clone(g.history)
+        moveHistory: clone(g.history),
+        roomId: room.id,
+        yourColor: room.white?.ws === ws ? 'w' : 'b',
+        whiteName: room.white?.name || '',
+        blackName: room.black?.name || '',
+        opponentName: room.white?.ws === ws ? (room.black?.name || 'Lawan') : (room.white?.name || 'Lawan')
     }
 }
 
 function startGame(room) {
     room.status = 'playing'
     room.game = makeGame()
-    room.game.positionCounts.set(positionKey(room.game), 1)
-    const whiteData = gameData(room, room.white.ws)
-    const blackData = gameData(room, room.black.ws)
-    send(room.white.ws, 'game_start', whiteData)
-    send(room.black.ws, 'game_start', blackData)
-    setTimeout(() => {
-        if (!rooms.has(room.id) || room.status !== 'playing' || !room.game) return
-        sendGameState(room, room.white.ws)
-        sendGameState(room, room.black.ws)
-    }, 50)
+    room.game.positionCounts.set(positionKey(room.game),1)
+    send(room.white.ws,'game_start',gameData(room,room.white.ws))
+    send(room.black.ws,'game_start',gameData(room,room.black.ws))
 }
 
 function backToLobby(ws) {
@@ -563,56 +548,48 @@ wss.on('connection', ws => {
         }
 
         if (msg.type === 'join_room') {
-            if (roomId) {
-                send(ws, 'error', { message: 'Kamu masih berada di room lain' })
-                return
-            }
+            if (roomId) return
             const id = String(msg.roomId || '').trim().toUpperCase()
             const room = rooms.get(id)
             const name = String(msg.name || 'Guest').trim().slice(0,18) || 'Guest'
-            if (!room || room.status !== 'waiting' || !room.white || room.black) {
-                send(ws, 'error', { message: 'ID room tidak tersedia' })
+            if (!room || room.status !== 'waiting' || !room.white) {
+                send(ws,'error',{message:'ID room tidak tersedia'})
                 return
             }
             if (room.white.name.toLowerCase() === name.toLowerCase()) {
-                send(ws, 'error', { message: 'Nama sudah dipakai' })
+                send(ws,'error',{message:'Nama sudah dipakai'})
                 return
             }
-            room.black = { id: clientId, name, ws }
-            room.clients.set(clientId, ws)
-            roomId = id
-            clients.get(ws).roomId = id
-            send(ws, 'join_accepted', {
-                roomId: id,
-                yourColor: 'b',
-                color: 'b',
-                whiteName: room.white.name,
-                blackName: name,
-                opponentName: room.white.name
-            })
-            send(room.white.ws, 'opponent_joined', {
-                roomId: id,
-                yourColor: 'w',
-                color: 'w',
-                whiteName: room.white.name,
-                blackName: name,
-                opponentName: name
-            })
+            room.black={id:clientId,name,ws}
+            room.clients.set(clientId,ws)
+            roomId=id
+            clients.get(ws).roomId=id
+            send(ws,'join_accepted',{roomId:id,yourColor:'b',whiteName:room.white.name,blackName:name})
+            send(room.white.ws,'opponent_joined',{roomId:id,opponentName:name})
             startGame(room)
             return
         }
 
-        const room = roomId ? rooms.get(roomId) : null
+        const requestedRoomId = String(msg.roomId || '').trim().toUpperCase()
+        const activeRoomId = roomId || requestedRoomId
+        const room = activeRoomId ? rooms.get(activeRoomId) : null
+
+        if (room && !roomId) {
+            roomId = activeRoomId
+            const current = clients.get(ws)
+            if (current) current.roomId = activeRoomId
+        }
+
         if (!room) {
-            if (msg.type === 'get_state' || msg.type === 'sync') {
-                send(ws, 'error', { message: 'Room belum aktif' })
-            }
+            if (msg.type === 'get_state' || msg.type === 'sync') send(ws,'error',{message:'Room tidak ditemukan'})
             return
         }
 
         if (msg.type === 'get_state' || msg.type === 'sync') {
-            if (room.status === 'playing' && room.game) sendGameState(room, ws)
-            else if (room.status === 'waiting') send(ws, 'room_waiting', { roomId: room.id })
+            if (room.status === 'playing' && room.game) {
+                const color = room.white?.ws === ws ? 'w' : room.black?.ws === ws ? 'b' : null
+                if (color) send(ws,'game_state',gameData(room,ws))
+            }
             return
         }
 
