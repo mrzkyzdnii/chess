@@ -395,7 +395,30 @@ function startGame(room) {
 }
 
 function backToLobby(ws) {
-    send(ws,'lobby_ready',{rooms:roomList()})
+    if (ws && ws.readyState === WebSocket.OPEN) send(ws,'lobby_ready',{rooms:roomList()})
+}
+
+function finishRoom(room, immediateWs = null, delay = 3000) {
+    const players = [room.white?.ws, room.black?.ws].filter(Boolean)
+    rooms.delete(room.id)
+    room.status = 'finished'
+    room.game = null
+    room.white = null
+    room.black = null
+    room.clients.clear()
+    room.rematch?.clear()
+
+    for (const player of players) {
+        const c = clients.get(player)
+        if (c) c.roomId = null
+    }
+
+    if (immediateWs) backToLobby(immediateWs)
+    for (const player of players) {
+        if (player === immediateWs) continue
+        setTimeout(() => backToLobby(player), delay)
+    }
+    broadcastLobby()
 }
 
 function broadcastLobby() {
@@ -479,6 +502,14 @@ wss.on('connection', ws => {
     ws.on('message', raw => {
         let msg
         try { msg = JSON.parse(raw.toString()) } catch { return }
+
+        if (msg.type === 'reset_lobby') {
+            roomId = null
+            const current = clients.get(ws)
+            if (current) current.roomId = null
+            send(ws,'room_list',{rooms:roomList()})
+            return
+        }
 
         if (msg.type === 'list_rooms') {
             send(ws,'room_list',{rooms:roomList()})
@@ -612,15 +643,23 @@ wss.on('connection', ws => {
             finish(g)
 
             broadcast(room,'game_state',stateData(g))
-            if (g.over) broadcast(room,'game_over',{result:g.result,winner:g.winner})
+            if (g.over) {
+                broadcast(room,'game_over',{result:g.result,winner:g.winner})
+                finishRoom(room,null,3000)
+                roomId = null
+            }
             return
         }
 
         if (msg.type === 'resign') {
-            g.over=true
-            g.result='resign'
-            g.winner=opposite(color)
-            broadcast(room,'game_over',{result:g.result,winner:g.winner})
+            const winnerColor = opposite(color)
+            const winnerWs = winnerColor === 'w' ? room.white?.ws : room.black?.ws
+            g.over = true
+            g.result = 'resign'
+            g.winner = winnerColor
+            broadcast(room,'game_over',{result:'resign',winner:winnerColor})
+            finishRoom(room,ws,3000)
+            roomId = null
             return
         }
 
