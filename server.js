@@ -15,9 +15,12 @@ const send = (ws, type, data) => {
 const broadcast = (room, type, data) => {
     for (const ws of room.clients.values()) send(ws, type, data)
 }
-const roomList = () => [...rooms.values()]
-    .filter(r => r.status === 'waiting')
-    .map(r => ({ id: r.id, name: r.name, hostName: r.white?.name || 'Guest' }))
+const roomInfo = room => ({
+    id: room.id,
+    status: room.status,
+    whiteName: room.white?.name || '',
+    blackName: room.black?.name || ''
+})
 
 const makeId = () => {
     let id
@@ -395,45 +398,58 @@ function startGame(room) {
 }
 
 function backToLobby(ws) {
-    if (ws && ws.readyState === WebSocket.OPEN) send(ws,'lobby_ready',{rooms:roomList()})
+    if (ws?.readyState === 1) send(ws, 'lobby_ready', { ok: true })
 }
 
-function finishRoom(room, immediateWs = null, delay = 3000) {
+function finishRoom(room, immediateWs = null, notifyClosed = true, lobbyDelay = 0) {
+    if (!room) return
     const players = [room.white?.ws, room.black?.ws].filter(Boolean)
     rooms.delete(room.id)
     room.status = 'finished'
     room.game = null
-    room.white = null
-    room.black = null
-    room.clients.clear()
     room.rematch?.clear()
+    room.clients.clear()
 
     for (const player of players) {
         const c = clients.get(player)
-        if (c) c.roomId = null
+        if (c?.roomId === room.id) c.roomId = null
+    }
+
+    if (notifyClosed) {
+        for (const player of players) {
+            if (player && player !== immediateWs) send(player, 'room_closed', { reason: 'opponent_left' })
+        }
     }
 
     if (immediateWs) backToLobby(immediateWs)
-    for (const player of players) {
-        if (player === immediateWs) continue
-        setTimeout(() => backToLobby(player), delay)
+    else if (lobbyDelay > 0) {
+        for (const player of players) setTimeout(() => backToLobby(player), lobbyDelay)
     }
-    broadcastLobby()
 }
 
-function broadcastLobby() {
-    for (const ws of clients.keys()) {
+function destroyWaitingRoom(room, ws = null) {
+    if (!room) return
+    rooms.delete(room.id)
+    room.status = 'finished'
+    room.clients.clear()
+    room.white = null
+    room.black = null
+    room.game = null
+    if (ws) {
         const c = clients.get(ws)
-        if (!c?.roomId) send(ws,'room_list',{rooms:roomList()})
+        if (c?.roomId === room.id) c.roomId = null
+        backToLobby(ws)
     }
 }
 
 function removeFromRoom(ws, reason = 'disconnect') {
-    const id = clients.get(ws)
-    if (!id) return
-    const room = rooms.get(id.roomId)
-    clients.delete(ws)
-    if (!room) return
+    const client = clients.get(ws)
+    if (!client?.roomId) return
+    const room = rooms.get(client.roomId)
+    if (!room) {
+        client.roomId = null
+        return
+    }
 
     const wasWhite = room.white?.ws === ws
     const wasBlack = room.black?.ws === ws
@@ -443,27 +459,23 @@ function removeFromRoom(ws, reason = 'disconnect') {
         room.game.over = true
         room.game.result = reason === 'leave' ? 'abandon' : 'disconnect'
         room.game.winner = winner
-        broadcast(room,'game_over',{ result:room.game.result, winner })
-    }
-
-    room.clients.delete(wasWhite ? room.white.id : wasBlack ? room.black.id : id.clientId)
-    if (wasWhite) room.white = null
-    if (wasBlack) room.black = null
-
-    if (room.clients.size === 0) {
-        rooms.delete(room.id)
-        if (reason === 'leave') backToLobby(ws)
-        broadcastLobby()
+        broadcast(room, 'game_over', {
+            result: room.game.result,
+            winner,
+            reason
+        })
+        finishRoom(room, ws)
+        client.roomId = null
         return
     }
 
-    if (room.status === 'playing') {
-        room.status = 'waiting'
-        room.game = null
+    if (room.status === 'waiting') {
+        destroyWaitingRoom(room, ws)
+        return
     }
-    room.rematch?.clear()
-    broadcast(room,'lobby_ready',{rooms:roomList()})
-    broadcastLobby()
+
+    finishRoom(room, ws)
+    client.roomId = null
 }
 
 const server = http.createServer((req,res) => {
@@ -507,12 +519,6 @@ wss.on('connection', ws => {
             roomId = null
             const current = clients.get(ws)
             if (current) current.roomId = null
-            send(ws,'room_list',{rooms:roomList()})
-            return
-        }
-
-        if (msg.type === 'list_rooms') {
-            send(ws,'room_list',{rooms:roomList()})
             return
         }
 
@@ -533,7 +539,6 @@ wss.on('connection', ws => {
             roomId=id
             clients.get(ws).roomId=id
             send(ws,'room_created',{roomId:id})
-            broadcastLobby()
             return
         }
 
@@ -543,7 +548,7 @@ wss.on('connection', ws => {
             const room = rooms.get(id)
             const name = String(msg.name || 'Guest').trim().slice(0,18) || 'Guest'
             if (!room || room.status !== 'waiting' || !room.white) {
-                send(ws,'error',{message:'Room tidak tersedia'})
+                send(ws,'error',{message:'ID room tidak tersedia'})
                 return
             }
             if (room.white.name.toLowerCase() === name.toLowerCase()) {
@@ -555,7 +560,6 @@ wss.on('connection', ws => {
             roomId=id
             clients.get(ws).roomId=id
             startGame(room)
-            broadcastLobby()
             return
         }
 
@@ -645,7 +649,7 @@ wss.on('connection', ws => {
             broadcast(room,'game_state',stateData(g))
             if (g.over) {
                 broadcast(room,'game_over',{result:g.result,winner:g.winner})
-                finishRoom(room,null,3000)
+                finishRoom(room, null, false, 3000)
                 roomId = null
             }
             return
@@ -658,7 +662,7 @@ wss.on('connection', ws => {
             g.result = 'resign'
             g.winner = winnerColor
             broadcast(room,'game_over',{result:'resign',winner:winnerColor})
-            finishRoom(room,ws,3000)
+            finishRoom(room,ws)
             roomId = null
             return
         }
@@ -667,8 +671,8 @@ wss.on('connection', ws => {
 
     ws.on('close', () => {
         const current = clients.get(ws)
-        const rid = current?.roomId
-        if (rid) removeFromRoom(ws,'disconnect')
+        if (current?.roomId) removeFromRoom(ws, 'disconnect')
+        clients.delete(ws)
     })
 })
 
