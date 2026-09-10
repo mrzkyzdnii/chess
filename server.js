@@ -152,7 +152,7 @@ function pseudoMoves(g, r, c) {
     const add = (rr, cc, extra = {}) => {
         if (!sq(rr, cc)) return
         const t = g.board[rr][cc]
-        if (!t || t.color !== p.color) out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:t?.type || null, ...extra })
+        if ((!t || t.color !== p.color) && t?.type !== 'k') out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:t?.type || null, ...extra })
     }
 
     if (p.type === 'p') {
@@ -194,7 +194,7 @@ function pseudoMoves(g, r, c) {
                 const t = g.board[rr][cc]
                 if (!t) out.push({from:{r,c},to:{r:rr,c:cc},captured:null})
                 else {
-                    if (t.color !== p.color) out.push({from:{r,c},to:{r:rr,c:cc},captured:t.type})
+                    if (t.color !== p.color && t.type !== 'k') out.push({from:{r,c},to:{r:rr,c:cc},captured:t.type})
                     break
                 }
                 rr+=dr; cc+=dc
@@ -394,8 +394,15 @@ function startGame(room) {
     send(room.black.ws,'game_start',gameData(room,room.black.ws))
 }
 
-function backToLobby(ws, room) {
+function backToLobby(ws) {
     send(ws,'lobby_ready',{rooms:roomList()})
+}
+
+function broadcastLobby() {
+    for (const ws of clients.keys()) {
+        const c = clients.get(ws)
+        if (!c?.roomId) send(ws,'room_list',{rooms:roomList()})
+    }
 }
 
 function removeFromRoom(ws, reason = 'disconnect') {
@@ -422,6 +429,8 @@ function removeFromRoom(ws, reason = 'disconnect') {
 
     if (room.clients.size === 0) {
         rooms.delete(room.id)
+        if (reason === 'leave') backToLobby(ws)
+        broadcastLobby()
         return
     }
 
@@ -429,7 +438,9 @@ function removeFromRoom(ws, reason = 'disconnect') {
         room.status = 'waiting'
         room.game = null
     }
+    room.rematch?.clear()
     broadcast(room,'lobby_ready',{rooms:roomList()})
+    broadcastLobby()
 }
 
 const server = http.createServer((req,res) => {
@@ -450,10 +461,20 @@ const server = http.createServer((req,res) => {
 
 const wss = new WebSocketServer({ server })
 
+const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+        if (ws.isAlive === false) { ws.terminate(); continue }
+        ws.isAlive = false
+        ws.ping()
+    }
+}, 25000)
+
 wss.on('connection', ws => {
     const clientId = crypto.randomBytes(6).toString('hex')
     let roomId = null
     clients.set(ws,{clientId,roomId})
+    ws.isAlive = true
+    ws.on('pong', () => { ws.isAlive = true })
 
     ws.on('message', raw => {
         let msg
@@ -481,6 +502,7 @@ wss.on('connection', ws => {
             roomId=id
             clients.get(ws).roomId=id
             send(ws,'room_created',{roomId:id})
+            broadcastLobby()
             return
         }
 
@@ -502,6 +524,7 @@ wss.on('connection', ws => {
             roomId=id
             clients.get(ws).roomId=id
             startGame(room)
+            broadcastLobby()
             return
         }
 
@@ -515,6 +538,7 @@ wss.on('connection', ws => {
         }
 
         if (msg.type === 'chat') {
+            if (room.status !== 'playing' || !room.game || room.game.over) return
             const text = String(msg.text || '').trim().slice(0,150)
             if (!text) return
             const from = room.white?.ws === ws ? room.white.name : room.black?.name || 'Guest'
@@ -522,10 +546,26 @@ wss.on('connection', ws => {
             return
         }
 
-        if (room.status !== 'playing' || !room.game || room.game.over) return
         const g = room.game
         const color = room.white?.ws === ws ? 'w' : room.black?.ws === ws ? 'b' : null
         if (!color) return
+
+        if (msg.type === 'rematch') {
+            if (room.status !== 'playing' || !g || !g.over) return
+            room.rematch ||= new Set()
+            if (room.rematch.has(color)) return
+            room.rematch.add(color)
+            const from = color === 'w' ? room.white?.name : room.black?.name
+            if (room.rematch.size >= 2) {
+                room.rematch.clear()
+                startGame(room)
+            } else {
+                broadcast(room,'rematch_requested',{from:from || 'Lawan'})
+            }
+            return
+        }
+
+        if (room.status !== 'playing' || !room.game || room.game.over) return
 
         if (msg.type === 'get_moves') {
             const r = Number(msg.square?.r), c = Number(msg.square?.c)
@@ -584,17 +624,6 @@ wss.on('connection', ws => {
             return
         }
 
-        if (msg.type === 'rematch') {
-            room.rematch ||= new Set()
-            room.rematch.add(color)
-            if (room.rematch.size >= 2) {
-                room.rematch.clear()
-                startGame(room)
-            } else {
-                send(ws,'rematch_requested',{})
-            }
-            return
-        }
     })
 
     ws.on('close', () => {
