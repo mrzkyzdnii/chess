@@ -1,412 +1,609 @@
-import { WebSocketServer } from 'ws';
-import http from 'http';
-import crypto from 'crypto';
+import { WebSocketServer } from 'ws'
+import http from 'http'
+import crypto from 'crypto'
 
-const PORT = process.env.PORT || 8084;
+const PORT = Number(process.env.PORT || 3000)
+const files = ['a','b','c','d','e','f','g','h']
 
-// ==== Config dunia ====
-const WORLD_RADIUS = 1400;          // dunia bulat kayak slither.io
-const TICK_MS = 45;                 // ~22 tick/detik simulasi
-const BROADCAST_EVERY = 2;          // kirim state tiap 2 tick (~11fps network, tetep mulus krn client interpolasi)
-const BASE_SPEED = 2.6;
-const BOOST_MULT = 1.9;
-const TURN_RATE = 0.16;             // radian/tick, biar belokan halus bukan instan
-const SEGMENT_SPACING = 9;
-const START_LENGTH = 10;
-const MIN_LENGTH_TO_BOOST = 12;
-const BOOST_DRAIN_EVERY = 4;        // tiap N tick boost, kepanjangan berkurang 1
-const FOOD_COUNT_TARGET = 170;
-const FOOD_EAT_PADDING = 6;
-const SPAWN_PROTECT_MS = 2500;
-const MAX_SEND_SEGMENTS = 90;
-const SELF_HIT_SKIP = 16;           // segmen deket kepala diabaikan biar gak mati pas belok tajam
-const KILL_BONUS = 8;
+const rooms = new Map()
+const clients = new Map()
 
-const PALETTE = ['#ff4d6d', '#00e756', '#29adff', '#ffec27', '#ff77a8', '#ab5236', '#00e5ff', '#ffa300', '#c084fc', '#4ade80'];
-const FOOD_COLORS = ['#ff6b81', '#7bed9f', '#70a1ff', '#eccc68', '#ff9ff3', '#1dd1a1', '#feca57', '#48dbfb'];
+const clone = x => JSON.parse(JSON.stringify(x))
+const send = (ws, type, data) => {
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ type, data, time: Date.now() }))
+}
+const broadcast = (room, type, data) => {
+    for (const ws of room.clients.values()) send(ws, type, data)
+}
+const roomList = () => [...rooms.values()]
+    .filter(r => r.status === 'waiting')
+    .map(r => ({ id: r.id, name: r.name, hostName: r.white?.name || 'Guest' }))
 
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', server: 'Snake-IO-Mini v1.0', uptime: process.uptime() }));
-});
-
-const wss = new WebSocketServer({ server });
-
-function genId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
-function rand(min, max) { return min + Math.random() * (max - min); }
-function dist2(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; }
-function normalizeAngle(a) { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; }
-
-function randomPointInWorld(marginFactor = 0.9) {
-    const r = WORLD_RADIUS * marginFactor * Math.sqrt(Math.random());
-    const a = Math.random() * Math.PI * 2;
-    return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+const makeId = () => {
+    let id
+    do id = crypto.randomBytes(3).toString('hex').toUpperCase()
+    while (rooms.has(id))
+    return id
 }
 
-function radiusForLength(length) {
-    return 7 + Math.min(length, 400) * 0.05;
-}
+const sq = (r, c) => r >= 0 && r < 8 && c >= 0 && c < 8
+const key = (r, c) => `${r},${c}`
+const opposite = c => c === 'w' ? 'b' : 'w'
+const colorName = c => c === 'w' ? 'White' : 'Black'
+const coord = (r, c) => files[c] + (8 - r)
 
-function makeFood(big = false) {
-    const p = randomPointInWorld(0.98);
-    return {
-        id: 'f' + crypto.randomBytes(4).toString('hex'),
-        x: p.x, y: p.y,
-        r: big ? 7 : 3.5,
-        value: big ? 5 : 1,
-        color: big ? '#ffd23f' : FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)]
-    };
-}
-
-const rooms = new Map();
-
-function getRoom(roomId) {
-    if (!rooms.has(roomId)) {
-        const room = {
-            snakes: new Map(),
-            clients: new Map(),
-            food: new Map(),
-            tickCount: 0,
-            tickInterval: null
-        };
-        for (let i = 0; i < FOOD_COUNT_TARGET; i++) {
-            const f = makeFood(Math.random() < 0.08);
-            room.food.set(f.id, f);
-        }
-        room.tickInterval = setInterval(() => tickRoom(room), TICK_MS);
-        rooms.set(roomId, room);
+function initialBoard() {
+    const b = Array.from({ length: 8 }, () => Array(8).fill(null))
+    const back = ['r','n','b','q','k','b','n','r']
+    for (let c = 0; c < 8; c++) {
+        b[0][c] = { type: back[c], color: 'b' }
+        b[1][c] = { type: 'p', color: 'b' }
+        b[6][c] = { type: 'p', color: 'w' }
+        b[7][c] = { type: back[c], color: 'w' }
     }
-    return rooms.get(roomId);
+    return b
 }
 
-function destroyRoomIfEmpty(room) {
+function makeGame() {
+    return {
+        board: initialBoard(),
+        turn: 'w',
+        castling: { wK: true, wQ: true, bK: true, bQ: true },
+        enPassant: null,
+        halfmove: 0,
+        fullmove: 1,
+        history: [],
+        positionCounts: new Map(),
+        lastMove: null,
+        over: false,
+        result: null,
+        winner: null
+    }
+}
+
+function snapshot(g) {
+    return {
+        board: clone(g.board),
+        turn: g.turn,
+        castling: { ...g.castling },
+        enPassant: g.enPassant ? { ...g.enPassant } : null,
+        halfmove: g.halfmove,
+        fullmove: g.fullmove
+    }
+}
+
+function restore(g, s) {
+    g.board = clone(s.board)
+    g.turn = s.turn
+    g.castling = { ...s.castling }
+    g.enPassant = s.enPassant ? { ...s.enPassant } : null
+    g.halfmove = s.halfmove
+    g.fullmove = s.fullmove
+}
+
+function findKing(g, color) {
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+        const p = g.board[r][c]
+        if (p?.color === color && p.type === 'k') return { r, c }
+    }
+    return null
+}
+
+function attacked(g, r, c, byColor) {
+    const b = g.board
+    const pawnDir = byColor === 'w' ? -1 : 1
+    const pr = r - pawnDir
+    for (const dc of [-1, 1]) {
+        const p = b[pr]?.[c + dc]
+        if (p?.color === byColor && p.type === 'p') return true
+    }
+
+    const knights = [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]]
+    for (const [dr, dc] of knights) {
+        const p = b[r + dr]?.[c + dc]
+        if (p?.color === byColor && p.type === 'n') return true
+    }
+
+    const diagonals = [[-1,-1],[-1,1],[1,-1],[1,1]]
+    for (const [dr, dc] of diagonals) {
+        let rr = r + dr, cc = c + dc
+        while (sq(rr, cc)) {
+            const p = b[rr][cc]
+            if (p) {
+                if (p.color === byColor && (p.type === 'b' || p.type === 'q')) return true
+                break
+            }
+            rr += dr
+            cc += dc
+        }
+    }
+
+    const straights = [[-1,0],[1,0],[0,-1],[0,1]]
+    for (const [dr, dc] of straights) {
+        let rr = r + dr, cc = c + dc
+        while (sq(rr, cc)) {
+            const p = b[rr][cc]
+            if (p) {
+                if (p.color === byColor && (p.type === 'r' || p.type === 'q')) return true
+                break
+            }
+            rr += dr
+            cc += dc
+        }
+    }
+
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue
+        const p = b[r + dr]?.[c + dc]
+        if (p?.color === byColor && p.type === 'k') return true
+    }
+    return false
+}
+
+function inCheck(g, color) {
+    const k = findKing(g, color)
+    return !k || attacked(g, k.r, k.c, opposite(color))
+}
+
+function pseudoMoves(g, r, c) {
+    const p = g.board[r]?.[c]
+    if (!p) return []
+    const out = []
+    const add = (rr, cc, extra = {}) => {
+        if (!sq(rr, cc)) return
+        const t = g.board[rr][cc]
+        if (!t || t.color !== p.color) out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:t?.type || null, ...extra })
+    }
+
+    if (p.type === 'p') {
+        const d = p.color === 'w' ? -1 : 1
+        const start = p.color === 'w' ? 6 : 1
+        const last = p.color === 'w' ? 0 : 7
+        if (sq(r+d,c) && !g.board[r+d][c]) {
+            if (r+d === last) for (const promotion of ['q','r','b','n']) out.push({ from:{r,c}, to:{r:r+d,c}, captured:null, promotion })
+            else out.push({ from:{r,c}, to:{r:r+d,c}, captured:null })
+            if (r === start && !g.board[r+2*d][c]) out.push({ from:{r,c}, to:{r:r+2*d,c}, captured:null, pawnDouble:true })
+        }
+        for (const dc of [-1,1]) {
+            const rr = r+d, cc = c+dc
+            if (!sq(rr,cc)) continue
+            const t = g.board[rr][cc]
+            if (t && t.color !== p.color) {
+                if (rr === last) for (const promotion of ['q','r','b','n']) out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:t.type, promotion })
+                else out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:t.type })
+            }
+            if (g.enPassant && g.enPassant.r === rr && g.enPassant.c === cc) {
+                out.push({ from:{r,c}, to:{r:rr,c:cc}, captured:'p', enPassant:true })
+            }
+        }
+    }
+
+    if (p.type === 'n') {
+        for (const [dr,dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]]) add(r+dr,c+dc)
+    }
+
+    if (p.type === 'b' || p.type === 'r' || p.type === 'q') {
+        const dirs = p.type === 'b'
+            ? [[-1,-1],[-1,1],[1,-1],[1,1]]
+            : p.type === 'r'
+                ? [[-1,0],[1,0],[0,-1],[0,1]]
+                : [[-1,-1],[-1,1],[1,-1],[1,1],[-1,0],[1,0],[0,-1],[0,1]]
+        for (const [dr,dc] of dirs) {
+            let rr=r+dr, cc=c+dc
+            while (sq(rr,cc)) {
+                const t = g.board[rr][cc]
+                if (!t) out.push({from:{r,c},to:{r:rr,c:cc},captured:null})
+                else {
+                    if (t.color !== p.color) out.push({from:{r,c},to:{r:rr,c:cc},captured:t.type})
+                    break
+                }
+                rr+=dr; cc+=dc
+            }
+        }
+    }
+
+    if (p.type === 'k') {
+        for (let dr=-1; dr<=1; dr++) for (let dc=-1; dc<=1; dc++) if (dr || dc) add(r+dr,c+dc)
+        const row = p.color === 'w' ? 7 : 0
+        const enemy = opposite(p.color)
+        if (r === row && c === 4 && !inCheck(g, p.color)) {
+            const ks = p.color === 'w' ? 'wK' : 'bK'
+            if (g.castling[ks] && !g.board[row][5] && !g.board[row][6] &&
+                g.board[row][7]?.type === 'r' && g.board[row][7]?.color === p.color &&
+                !attacked(g,row,5,enemy) && !attacked(g,row,6,enemy))
+                out.push({from:{r,c},to:{r,c:6},captured:null,castle:'K'})
+            const qs = p.color === 'w' ? 'wQ' : 'bQ'
+            if (g.castling[qs] && !g.board[row][1] && !g.board[row][2] && !g.board[row][3] &&
+                g.board[row][0]?.type === 'r' && g.board[row][0]?.color === p.color &&
+                !attacked(g,row,3,enemy) && !attacked(g,row,2,enemy))
+                out.push({from:{r,c},to:{r,c:2},captured:null,castle:'Q'})
+        }
+    }
+
+    return out
+}
+
+function applyMove(g, m, validate = true) {
+    const p = g.board[m.from.r][m.from.c]
+    if (!p) return false
+    const target = g.board[m.to.r][m.to.c]
+    g.board[m.from.r][m.from.c] = null
+
+    if (m.enPassant) {
+        const cr = m.from.r
+        g.board[cr][m.to.c] = null
+    }
+
+    g.board[m.to.r][m.to.c] = { type: m.promotion || p.type, color: p.color }
+
+    if (m.castle) {
+        const row = p.color === 'w' ? 7 : 0
+        if (m.castle === 'K') {
+            g.board[row][5] = g.board[row][7]
+            g.board[row][7] = null
+        } else {
+            g.board[row][3] = g.board[row][0]
+            g.board[row][0] = null
+        }
+    }
+
+    const c = p.color
+    if (p.type === 'k') {
+        g.castling[c === 'w' ? 'wK' : 'bK'] = false
+        g.castling[c === 'w' ? 'wQ' : 'bQ'] = false
+    }
+    if (p.type === 'r') {
+        if (m.from.r === 7 && m.from.c === 0) g.castling.wQ = false
+        if (m.from.r === 7 && m.from.c === 7) g.castling.wK = false
+        if (m.from.r === 0 && m.from.c === 0) g.castling.bQ = false
+        if (m.from.r === 0 && m.from.c === 7) g.castling.bK = false
+    }
+    if (target?.type === 'r') {
+        if (m.to.r === 7 && m.to.c === 0) g.castling.wQ = false
+        if (m.to.r === 7 && m.to.c === 7) g.castling.wK = false
+        if (m.to.r === 0 && m.to.c === 0) g.castling.bQ = false
+        if (m.to.r === 0 && m.to.c === 7) g.castling.bK = false
+    }
+
+    g.enPassant = null
+    if (p.type === 'p' && Math.abs(m.to.r - m.from.r) === 2)
+        g.enPassant = { r:(m.to.r+m.from.r)/2, c:m.from.c }
+
+    g.halfmove = (p.type === 'p' || target || m.enPassant) ? 0 : g.halfmove + 1
+    if (c === 'b') g.fullmove++
+    g.turn = opposite(c)
+    return true
+}
+
+function legalMoves(g, r, c) {
+    const p = g.board[r]?.[c]
+    if (!p) return []
+    const result = []
+    for (const m of pseudoMoves(g,r,c)) {
+        const s = snapshot(g)
+        applyMove(g,m,false)
+        if (!inCheck(g,p.color)) result.push(m)
+        restore(g,s)
+    }
+    return result
+}
+
+function allLegal(g, color = g.turn) {
+    const out = []
+    for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        if (g.board[r][c]?.color !== color) continue
+        out.push(...legalMoves(g,r,c))
+    }
+    return out
+}
+
+function insufficient(g) {
+    const pieces = []
+    for (const row of g.board) for (const p of row) if (p) pieces.push(p)
+    const nonKings = pieces.filter(p => p.type !== 'k')
+    if (!nonKings.length) return true
+    if (nonKings.some(p => ['p','q','r'].includes(p.type))) return false
+    if (nonKings.length === 1 && ['b','n'].includes(nonKings[0].type)) return true
+    if (nonKings.every(p => p.type === 'b')) {
+        const squares = []
+        for (let r=0;r<8;r++) for (let c=0;c<8;c++) if (g.board[r][c]?.type === 'b') squares.push((r+c)%2)
+        return squares.every(x => x === squares[0])
+    }
+    return false
+}
+
+function positionKey(g) {
+    const board = g.board.map(row => row.map(p => p ? p.color+p.type : '--').join('')).join('/')
+    const cast = Object.entries(g.castling).filter(([,v])=>v).map(([k])=>k).join('')
+    const ep = g.enPassant ? `${g.enPassant.r}${g.enPassant.c}` : '-'
+    return `${board}|${g.turn}|${cast}|${ep}`
+}
+
+function notation(g, m, mover, capture, checkAfter) {
+    if (m.castle === 'K') return checkAfter ? 'O-O+' : 'O-O'
+    if (m.castle === 'Q') return checkAfter ? 'O-O#' : 'O-O'
+    const piece = mover.type === 'p' ? '' : mover.type.toUpperCase()
+    const filePart = mover.type === 'p' && (capture || m.enPassant) ? files[m.from.c] : ''
+    const cap = capture || m.enPassant ? 'x' : ''
+    const promo = m.promotion ? `=${m.promotion.toUpperCase()}` : ''
+    const dest = coord(m.to.r,m.to.c)
+    return `${piece}${filePart}${cap}${dest}${promo}${checkAfter ? (allLegal(g,g.turn).length ? '+' : '#') : ''}`
+}
+
+function finish(g) {
+    const moves = allLegal(g,g.turn)
+    const check = inCheck(g,g.turn)
+    if (!moves.length) {
+        g.over = true
+        if (check) {
+            g.result = 'checkmate'
+            g.winner = opposite(g.turn)
+        } else {
+            g.result = 'stalemate'
+            g.winner = null
+        }
+        return
+    }
+    if (g.halfmove >= 100) {
+        g.over = true
+        g.result = 'draw_50move'
+        g.winner = null
+        return
+    }
+    if (insufficient(g)) {
+        g.over = true
+        g.result = 'draw_material'
+        g.winner = null
+        return
+    }
+    const pk = positionKey(g)
+    if ((g.positionCounts.get(pk) || 0) >= 3) {
+        g.over = true
+        g.result = 'draw_repetition'
+        g.winner = null
+    }
+}
+
+function gameData(room, ws) {
+    const g = room.game
+    return {
+        roomId: room.id,
+        yourColor: room.white?.ws === ws ? 'w' : 'b',
+        board: clone(g.board),
+        turn: g.turn,
+        whiteName: room.white?.name || '',
+        blackName: room.black?.name || ''
+    }
+}
+
+function stateData(g) {
+    return {
+        board: clone(g.board),
+        turn: g.turn,
+        lastMove: g.lastMove ? clone(g.lastMove) : null,
+        check: inCheck(g,g.turn),
+        moveHistory: clone(g.history)
+    }
+}
+
+function startGame(room) {
+    room.status = 'playing'
+    room.game = makeGame()
+    room.game.positionCounts.set(positionKey(room.game),1)
+    send(room.white.ws,'game_start',gameData(room,room.white.ws))
+    send(room.black.ws,'game_start',gameData(room,room.black.ws))
+}
+
+function backToLobby(ws, room) {
+    send(ws,'lobby_ready',{rooms:roomList()})
+}
+
+function removeFromRoom(ws, reason = 'disconnect') {
+    const id = clients.get(ws)
+    if (!id) return
+    const room = rooms.get(id.roomId)
+    clients.delete(ws)
+    if (!room) return
+
+    const wasWhite = room.white?.ws === ws
+    const wasBlack = room.black?.ws === ws
+
+    if (room.status === 'playing' && (wasWhite || wasBlack) && room.game && !room.game.over) {
+        const winner = wasWhite ? 'b' : 'w'
+        room.game.over = true
+        room.game.result = reason === 'leave' ? 'abandon' : 'disconnect'
+        room.game.winner = winner
+        broadcast(room,'game_over',{ result:room.game.result, winner })
+    }
+
+    room.clients.delete(wasWhite ? room.white.id : wasBlack ? room.black.id : id.clientId)
+    if (wasWhite) room.white = null
+    if (wasBlack) room.black = null
+
     if (room.clients.size === 0) {
-        for (const [rid, r] of rooms.entries()) {
-            if (r === room) {
-                clearInterval(r.tickInterval);
-                rooms.delete(rid);
-                break;
+        rooms.delete(room.id)
+        return
+    }
+
+    if (room.status === 'playing') {
+        room.status = 'waiting'
+        room.game = null
+    }
+    broadcast(room,'lobby_ready',{rooms:roomList()})
+}
+
+const server = http.createServer((req,res) => {
+    if (req.url === '/health' || req.url === '/') {
+        res.writeHead(200,{'content-type':'application/json'})
+        res.end(JSON.stringify({
+            status:'ok',
+            server:'Chess Online',
+            rooms:rooms.size,
+            players:[...clients.values()].length,
+            uptime:process.uptime()
+        }))
+        return
+    }
+    res.writeHead(404,{'content-type':'application/json'})
+    res.end(JSON.stringify({status:'not_found'}))
+})
+
+const wss = new WebSocketServer({ server })
+
+wss.on('connection', ws => {
+    const clientId = crypto.randomBytes(6).toString('hex')
+    let roomId = null
+    clients.set(ws,{clientId,roomId})
+
+    ws.on('message', raw => {
+        let msg
+        try { msg = JSON.parse(raw.toString()) } catch { return }
+
+        if (msg.type === 'list_rooms') {
+            send(ws,'room_list',{rooms:roomList()})
+            return
+        }
+
+        if (msg.type === 'create_room') {
+            if (roomId) return
+            const name = String(msg.name || 'Guest').trim().slice(0,18) || 'Guest'
+            const id = makeId()
+            const room = {
+                id,
+                name:String(msg.roomName || `${name}'s Room`).trim().slice(0,30) || `${name}'s Room`,
+                status:'waiting',
+                white:{id:clientId,name,ws},
+                black:null,
+                clients:new Map([[clientId,ws]]),
+                game:null
             }
+            rooms.set(id,room)
+            roomId=id
+            clients.get(ws).roomId=id
+            send(ws,'room_created',{roomId:id})
+            return
         }
-    }
-}
 
-function send(ws, type, data) {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, data, time: Date.now() }));
-}
-
-function broadcastChat(room, from, color, text) {
-    for (const ws of room.clients.values()) send(ws, 'chat', { from, color, text, time: Date.now() });
-}
-
-function broadcastSystem(room, text) {
-    for (const ws of room.clients.values()) send(ws, 'system', { text });
-}
-
-function spawnSnake(room, id, name, color) {
-    let pos = randomPointInWorld(0.55);
-    for (let i = 0; i < 12; i++) {
-        let ok = true;
-        for (const s of room.snakes.values()) {
-            if (!s.alive) continue;
-            if (dist2(pos.x, pos.y, s.x, s.y) < 220 * 220) { ok = false; break; }
-        }
-        if (ok) break;
-        pos = randomPointInWorld(0.55);
-    }
-    const angle = Math.random() * Math.PI * 2;
-    const path = [];
-    const pts = START_LENGTH * SEGMENT_SPACING + 60;
-    for (let i = 0; i < pts; i++) {
-        path.push({ x: pos.x - Math.cos(angle) * i, y: pos.y - Math.sin(angle) * i });
-    }
-    return {
-        id, name, color,
-        x: pos.x, y: pos.y,
-        angle, targetAngle: angle,
-        length: START_LENGTH,
-        growth: 0,
-        score: 0,
-        boosting: false,
-        boostTickCounter: 0,
-        alive: true,
-        spawnUntil: Date.now() + SPAWN_PROTECT_MS,
-        path
-    };
-}
-
-function dropFoodFromCorpse(room, snake) {
-    const step = 3;
-    let count = 0;
-    for (let i = 0; i < snake.path.length && count < 40; i += step) {
-        if (i * (BASE_SPEED) > snake.length * SEGMENT_SPACING) break;
-        const p = snake.path[i];
-        const jitterX = p.x + rand(-6, 6), jitterY = p.y + rand(-6, 6);
-        const f = {
-            id: 'f' + crypto.randomBytes(4).toString('hex'),
-            x: jitterX, y: jitterY,
-            r: 5, value: 3, color: snake.color
-        };
-        room.food.set(f.id, f);
-        count++;
-    }
-}
-
-function killSnake(room, snake, reason) {
-    if (!snake.alive) return;
-    snake.alive = false;
-    dropFoodFromCorpse(room, snake);
-    const ws = room.clients.get(snake.id);
-    send(ws, 'died', { score: snake.score, length: snake.length, reason });
-    broadcastSystem(room, `💀 ${snake.name} mati (${reason}) — panjang ${snake.length}, skor ${snake.score}`);
-}
-
-function ensureFood(room) {
-    let tries = 0;
-    while (room.food.size < FOOD_COUNT_TARGET && tries < 20) {
-        const f = makeFood(Math.random() < 0.06);
-        room.food.set(f.id, f);
-        tries++;
-    }
-}
-
-function tickRoom(room) {
-    ensureFood(room);
-    const now = Date.now();
-
-    for (const snake of room.snakes.values()) {
-        if (!snake.alive) continue;
-
-        let diff = normalizeAngle(snake.targetAngle - snake.angle);
-        const maxTurn = TURN_RATE;
-        if (diff > maxTurn) diff = maxTurn; else if (diff < -maxTurn) diff = -maxTurn;
-        snake.angle = normalizeAngle(snake.angle + diff);
-
-        const boosting = !!snake.boosting && snake.length > MIN_LENGTH_TO_BOOST;
-        snake.boosting = boosting;
-        const speed = boosting ? BASE_SPEED * BOOST_MULT : BASE_SPEED;
-
-        snake.x += Math.cos(snake.angle) * speed;
-        snake.y += Math.sin(snake.angle) * speed;
-
-        snake.path.unshift({ x: snake.x, y: snake.y });
-        const maxPathLen = Math.ceil((snake.length * SEGMENT_SPACING) / BASE_SPEED) + 80;
-        if (snake.path.length > maxPathLen) snake.path.length = maxPathLen;
-
-        if (boosting) {
-            snake.boostTickCounter++;
-            if (snake.boostTickCounter >= BOOST_DRAIN_EVERY) {
-                snake.boostTickCounter = 0;
-                if (snake.length > MIN_LENGTH_TO_BOOST) {
-                    snake.length -= 1;
-                    const tail = snake.path[snake.path.length - 1];
-                    if (tail) {
-                        const f = { id: 'f' + crypto.randomBytes(4).toString('hex'), x: tail.x, y: tail.y, r: 4, value: 1, color: snake.color };
-                        room.food.set(f.id, f);
-                    }
-                }
+        if (msg.type === 'join_room') {
+            if (roomId) return
+            const id = String(msg.roomId || '').trim().toUpperCase()
+            const room = rooms.get(id)
+            const name = String(msg.name || 'Guest').trim().slice(0,18) || 'Guest'
+            if (!room || room.status !== 'waiting' || !room.white) {
+                send(ws,'error',{message:'Room tidak tersedia'})
+                return
             }
-        }
-
-        const distFromCenter = Math.hypot(snake.x, snake.y);
-        if (distFromCenter > WORLD_RADIUS) {
-            killSnake(room, snake, 'nabrak batas dunia');
-            continue;
-        }
-
-        if (snake.growth > 0) {
-            snake.length += 1;
-            snake.growth -= 1;
-        }
-
-        const headR = radiusForLength(snake.length);
-        for (const [fid, food] of room.food.entries()) {
-            const rr = headR + food.r + FOOD_EAT_PADDING;
-            if (dist2(snake.x, snake.y, food.x, food.y) < rr * rr) {
-                room.food.delete(fid);
-                snake.growth += food.value;
-                snake.score += food.value * 2;
+            if (room.white.name.toLowerCase() === name.toLowerCase()) {
+                send(ws,'error',{message:'Nama sudah dipakai'})
+                return
             }
-        }
-    }
-
-    for (const snake of room.snakes.values()) {
-        if (!snake.alive) continue;
-        if (now < snake.spawnUntil) continue;
-        const headR = radiusForLength(snake.length);
-
-        let died = false;
-        for (const other of room.snakes.values()) {
-            if (other.id === snake.id || !other.alive) continue;
-            if (now < other.spawnUntil) continue;
-            const otherR = radiusForLength(other.length);
-            const otherLimit = other.length * SEGMENT_SPACING;
-            for (let i = 0; i < other.path.length; i += 2) {
-                const travelled = i * BASE_SPEED;
-                if (travelled > otherLimit) break;
-                const seg = other.path[i];
-                const rr = headR * 0.75 + otherR * 0.75;
-                if (dist2(snake.x, snake.y, seg.x, seg.y) < rr * rr) {
-                    killSnake(room, snake, `nabrak badan ${other.name}`);
-                    other.score += KILL_BONUS;
-                    died = true;
-                    break;
-                }
-            }
-            if (died) break;
-        }
-        if (died) continue;
-
-        const selfLimit = snake.length * SEGMENT_SPACING;
-        for (let i = SELF_HIT_SKIP; i < snake.path.length; i += 2) {
-            const travelled = i * BASE_SPEED;
-            if (travelled > selfLimit) break;
-            const seg = snake.path[i];
-            if (dist2(snake.x, snake.y, seg.x, seg.y) < (headR * 0.7) * (headR * 0.7)) {
-                killSnake(room, snake, 'nabrak badan sendiri');
-                break;
-            }
-        }
-    }
-
-    room.tickCount++;
-    if (room.tickCount % BROADCAST_EVERY === 0) broadcastState(room);
-}
-
-function serializeSnake(s) {
-    const totalNeeded = Math.min(Math.max(s.length, 4), MAX_SEND_SEGMENTS);
-    const step = Math.max(1, Math.floor(s.path.length / totalNeeded));
-    const segs = [];
-    for (let i = 0, count = 0; i < s.path.length && count < totalNeeded; i += step, count++) {
-        const p = s.path[i];
-        segs.push([Math.round(p.x), Math.round(p.y)]);
-    }
-    return {
-        id: s.id, name: s.name, color: s.color,
-        x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10,
-        angle: Math.round(s.angle * 100) / 100,
-        r: Math.round(radiusForLength(s.length) * 10) / 10,
-        length: s.length,
-        score: s.score,
-        boosting: !!s.boosting,
-        invuln: Date.now() < s.spawnUntil,
-        segs
-    };
-}
-
-function broadcastState(room) {
-    const alive = [...room.snakes.values()].filter(s => s.alive);
-    const snakesArr = alive.map(serializeSnake);
-    const foodArr = [...room.food.values()].map(f => [Math.round(f.x), Math.round(f.y), f.r, f.color]);
-    const leaderboard = alive.slice().sort((a, b) => b.score - a.score).slice(0, 8)
-        .map(s => ({ name: s.name, score: s.score, color: s.color, length: s.length }));
-    const payload = {
-        snakes: snakesArr,
-        food: foodArr,
-        leaderboard,
-        world: { radius: WORLD_RADIUS },
-        alive: alive.length
-    };
-    for (const ws of room.clients.values()) send(ws, 'state', payload);
-}
-
-wss.on('connection', (ws) => {
-    const clientId = genId();
-    let joinedRoom = null;
-    let joinedName = '';
-    let joinedColor = PALETTE[Math.floor(Math.random() * PALETTE.length)];
-    let lastDir = 0;
-
-    console.log(`[+] Client: ${clientId}`);
-
-    ws.on('message', (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
-
-        // ==== JOIN ====
-        if (msg.type === 'join') {
-            const roomId = String(msg.room || 'default').slice(0, 100);
-            const name = String(msg.name || '').trim().slice(0, 16);
-            const room = getRoom(roomId);
-
-            if (!name) {
-                send(ws, 'join_error', { message: 'Nama tidak boleh kosong' });
-                return;
-            }
-            const taken = [...room.snakes.values()].some(s => s.alive && s.name.toLowerCase() === name.toLowerCase());
-            if (taken) {
-                send(ws, 'join_error', { message: `Nama "${name}" sudah dipakai, coba nama lain` });
-                return;
-            }
-
-            joinedColor = PALETTE[room.clients.size % PALETTE.length];
-            const snake = spawnSnake(room, clientId, name, joinedColor);
-            room.snakes.set(clientId, snake);
-            room.clients.set(clientId, ws);
-            joinedRoom = room;
-            joinedName = name;
-
-            send(ws, 'joined', { id: clientId, world: { radius: WORLD_RADIUS } });
-            broadcastSystem(room, `🐍 ${name} masuk arena`);
-            return;
+            room.black={id:clientId,name,ws}
+            room.clients.set(clientId,ws)
+            roomId=id
+            clients.get(ws).roomId=id
+            startGame(room)
+            return
         }
 
-        if (!joinedRoom) return;
+        const room = roomId ? rooms.get(roomId) : null
+        if (!room) return
 
-        // ==== RESPAWN (setelah mati) ====
-        if (msg.type === 'respawn') {
-            const already = joinedRoom.snakes.get(clientId);
-            if (already && already.alive) return;
-            const snake = spawnSnake(joinedRoom, clientId, joinedName, joinedColor);
-            joinedRoom.snakes.set(clientId, snake);
-            send(ws, 'joined', { id: clientId, world: { radius: WORLD_RADIUS } });
-            return;
+        if (msg.type === 'leave_room') {
+            removeFromRoom(ws,'leave')
+            roomId=null
+            return
         }
 
-        const snake = joinedRoom.snakes.get(clientId);
-        if (!snake || !snake.alive) return;
-
-        // ==== DIR (arah gerak, radian) ====
-        if (msg.type === 'dir') {
-            const a = Number(msg.angle);
-            if (!Number.isFinite(a)) return;
-            const now = Date.now();
-            if (now - lastDir < 20) return;
-            lastDir = now;
-            snake.targetAngle = a;
-            return;
-        }
-
-        // ==== BOOST ====
-        if (msg.type === 'boost') {
-            snake.boosting = !!msg.on;
-            return;
-        }
-
-        // ==== CHAT ====
         if (msg.type === 'chat') {
-            const text = String(msg.text || '').slice(0, 200).trim();
-            if (!text) return;
-            broadcastChat(joinedRoom, joinedName, joinedColor, text);
-            return;
+            const text = String(msg.text || '').trim().slice(0,150)
+            if (!text) return
+            const from = room.white?.ws === ws ? room.white.name : room.black?.name || 'Guest'
+            broadcast(room,'chat',{from,text})
+            return
         }
-    });
+
+        if (room.status !== 'playing' || !room.game || room.game.over) return
+        const g = room.game
+        const color = room.white?.ws === ws ? 'w' : room.black?.ws === ws ? 'b' : null
+        if (!color) return
+
+        if (msg.type === 'get_moves') {
+            const r = Number(msg.square?.r), c = Number(msg.square?.c)
+            if (!sq(r,c) || g.board[r][c]?.color !== color || g.turn !== color) {
+                send(ws,'legal_moves',{square:{r,c},moves:[]})
+                return
+            }
+            send(ws,'legal_moves',{square:{r,c},moves:legalMoves(g,r,c).map(m => ({r:m.to.r,c:m.to.c,capture:!!m.captured,promotion:m.promotion || null}))})
+            return
+        }
+
+        if (msg.type === 'move') {
+            if (g.turn !== color) return
+            const fr = Number(msg.from?.r), fc = Number(msg.from?.c), tr = Number(msg.to?.r), tc = Number(msg.to?.c)
+            if (![fr,fc,tr,tc].every(Number.isInteger) || !sq(fr,fc) || !sq(tr,tc)) return
+            const p = g.board[fr][fc]
+            if (!p || p.color !== color) return
+            let candidates = legalMoves(g,fr,fc).filter(m => m.to.r === tr && m.to.c === tc)
+            if (!candidates.length) {
+                send(ws,'error',{message:'Langkah tidak valid'})
+                return
+            }
+            const chosen = candidates.find(m => !m.promotion || m.promotion === String(msg.promotion || '').toLowerCase())
+            if (!chosen) {
+                send(ws,'error',{message:'Pilih promosi'})
+                return
+            }
+
+            const captured = chosen.captured
+            const mover = clone(p)
+            applyMove(g,chosen)
+            const checkAfter = inCheck(g,g.turn)
+            const moveNotation = notation(g,chosen,mover,!!captured,checkAfter)
+            g.history.push({
+                notation:moveNotation,
+                captured:captured || null,
+                byColor:color,
+                from:chosen.from,
+                to:chosen.to
+            })
+            g.lastMove={from:chosen.from,to:chosen.to}
+            const pk = positionKey(g)
+            g.positionCounts.set(pk,(g.positionCounts.get(pk)||0)+1)
+            finish(g)
+
+            broadcast(room,'game_state',stateData(g))
+            if (g.over) broadcast(room,'game_over',{result:g.result,winner:g.winner})
+            return
+        }
+
+        if (msg.type === 'resign') {
+            g.over=true
+            g.result='resign'
+            g.winner=opposite(color)
+            broadcast(room,'game_over',{result:g.result,winner:g.winner})
+            return
+        }
+
+        if (msg.type === 'rematch') {
+            room.rematch ||= new Set()
+            room.rematch.add(color)
+            if (room.rematch.size >= 2) {
+                room.rematch.clear()
+                startGame(room)
+            } else {
+                send(ws,'rematch_requested',{})
+            }
+            return
+        }
+    })
 
     ws.on('close', () => {
-        if (joinedRoom) {
-            const snake = joinedRoom.snakes.get(clientId);
-            joinedRoom.snakes.delete(clientId);
-            joinedRoom.clients.delete(clientId);
-            if (snake && snake.alive) broadcastSystem(joinedRoom, `${joinedName} keluar arena`);
-            destroyRoomIfEmpty(joinedRoom);
-        }
-        console.log(`[-] Client: ${clientId}`);
-    });
-});
+        const current = clients.get(ws)
+        const rid = current?.roomId
+        if (rid) removeFromRoom(ws,'disconnect')
+    })
+})
 
-server.listen(PORT, () => {
-    console.log('========================================');
-    console.log('  Snake-IO-Mini v1.0 (multiplayer .io snake)');
-    console.log(`  Port: ${PORT}`);
-    console.log('========================================');
-});
+server.listen(PORT,'0.0.0.0',() => {
+    console.log(`Chess Online listening on ${PORT}`)
+})
